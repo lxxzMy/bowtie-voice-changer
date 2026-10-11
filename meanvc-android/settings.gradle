@@ -1,0 +1,24 @@
+pluginManagement {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    // PREFER_SETTINGS (not FAIL_ON_PROJECT_REPOS): the user's global
+    // ~/.gradle/init.gradle injects mirror repos into allprojects — ignore
+    // them here instead of failing; settings repos below already cover it
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = 'MeanVC'
+include ':app'

@@ -1,0 +1,75 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.mean2vc.voice'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'com.mean2vc.voice'
+        // 28 = AAudio setUsage/setInputPreset (the AEC / voice-call path needs
+        // them); loading libmeanvc.so on older devices would fail on the
+        // missing symbols
+        minSdk 28
+        targetSdk 35
+        versionCode 1
+        versionName '0.1'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared', '-DCMAKE_BUILD_TYPE=Release'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    // assets are synced (exactly the 9 needed files) from the MeanVC2 checkout
+    // into build/generated — single source of truth; includes the Q4 speaker
+    // encoder (334 MB) for on-device voice cloning
+    sourceSets {
+        main {
+            assets.srcDirs += [new File(buildDir, 'generated/meanvcAssets').absolutePath]
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}
+
+tasks.register('syncMeanvcAssets', Copy) {
+    from(new File(projectDir, '../../MeanVC2/onnx_models')) {
+        include 'kaldi_fbank.onnx', 'asr_80ms_fp32.onnx', 'dit_40ms_fp32.onnx',
+                'vocos_fp32.onnx', 'vocos_istft_t6.onnx',
+                'resample_48k16k.onnx', 'resample_16k48k.onnx',
+                'spk_encoder_q4.onnx', 'spk_encoder_q4.onnx.data'
+        into 'models'
+    }
+    from(new File(projectDir, '../../MeanVC2/test_audio')) {
+        include 'reference_1.spk.npy'
+        into 'spk'
+    }
+    into new File(buildDir, 'generated/meanvcAssets')
+}
+preBuild.dependsOn syncMeanvcAssets
+
+dependencies {
+    // none: plain android.app.Activity UI, no AndroidX
+}
