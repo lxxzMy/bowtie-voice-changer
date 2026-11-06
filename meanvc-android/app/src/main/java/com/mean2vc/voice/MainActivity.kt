@@ -224,27 +224,36 @@ class MainActivity : Activity() {
                         showConsent()
                         return@inner
                     }
-                    populateDevices()
-                    val echoListener = object : AdapterView.OnItemSelectedListener {
-                        override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                        }
-                        override fun onNothingSelected(p: AdapterView<*>?) {}
-                    }
-                    inSpin.onItemSelectedListener = echoListener
-                    outSpin.onItemSelectedListener = echoListener
-                    spkAdapter = ArrayAdapter(this,
-                        android.R.layout.simple_spinner_item, mutableListOf("默认音色")).apply {
-                        setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-                    }
-                    spkSpin.adapter = spkAdapter
-                    suppressSpk = true   // adapter attach fires a selection event
-                    spkSpin.post { suppressSpk = false }   // …but not always; clear it regardless
-                    refreshCards()
-                    syncBowtie()
-                    onLeftMode(0)          // prime the right wheel for 变声
+                    finishInit()
                 }
             }
         }.start()
+    }
+
+    /** one-time post-init wiring: device spinners, voice-card list, bowtie
+     *  priming. Runs after nativeInit succeeded AND consent is on file —
+     *  called from initEngine, or from the consent dialog's 同意 button
+     *  (initEngine bails out before this point when consent is missing). */
+    private fun finishInit() {
+        if (::spkAdapter.isInitialized) return   // idempotent
+        populateDevices()
+        val echoListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+            }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+        inSpin.onItemSelectedListener = echoListener
+        outSpin.onItemSelectedListener = echoListener
+        spkAdapter = ArrayAdapter(this,
+            android.R.layout.simple_spinner_item, mutableListOf("默认音色")).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        spkSpin.adapter = spkAdapter
+        suppressSpk = true   // adapter attach fires a selection event
+        spkSpin.post { suppressSpk = false }   // …but not always; clear it regardless
+        refreshCards()
+        syncBowtie()
+        onLeftMode(0)          // prime the right wheel for 变声
     }
 
     /** copy the graphs + speaker card from APK assets to filesDir (ORT needs
@@ -439,23 +448,36 @@ class MainActivity : Activity() {
         toggling = true
         say("starting…")
         thread {
-            // ALWAYS the call path: VOICE_COMMUNICATION preset engages the
-            // platform AEC (anti-howling on the loudspeaker), and the routing
-            // below sends the output to the speakerphone. Streams open AFTER
-            // the route (mode+route then open — a post-open reroute would
-            // tear the streams down).
-            applyCommRouting(true)
-            val ok = nativeStart(40.0, inId, outId, true)
-            handler.post {
-                toggling = false
-                running = ok
-                syncBowtie()
-                if (!ok) {
-                    say("启动失败(设备不可用?详见logcat)")
-                    applyCommRouting(false)
-                    setControls(true)
-                } else {
-                    handler.postDelayed(poll, 250)
+            var ok = false
+            try {
+                // ALWAYS the call path: VOICE_COMMUNICATION preset engages the
+                // platform AEC (anti-howling on the loudspeaker), and the routing
+                // below sends the output to the speakerphone. Streams open AFTER
+                // the route (mode+route then open — a post-open reroute would
+                // tear the streams down).
+                applyCommRouting(true)
+                // drain pending card switches FIRST: the engine must start on
+                // the card the user picked, and nativeSetCard's load_spk must
+                // not race the worker's feed() on spks_
+                cardExecutor.submit { }.get()
+                ok = nativeStart(40.0, inId, outId, true)
+            } catch (e: Exception) {
+                if (e is InterruptedException) Thread.currentThread().interrupt()
+                say("启动异常: ${e.message}")
+            } finally {
+                // toggling MUST reset even when the drain/start throws, or the
+                // knot stays dead until the process restarts
+                handler.post {
+                    toggling = false
+                    running = ok
+                    syncBowtie()
+                    if (!ok) {
+                        say("启动失败(设备不可用?详见logcat)")
+                        applyCommRouting(false)
+                        setControls(true)
+                    } else {
+                        handler.postDelayed(poll, 250)
+                    }
                 }
             }
         }
@@ -814,15 +836,33 @@ class MainActivity : Activity() {
         val name = if (cardIdx in cards.indices) cards[cardIdx] else defaultCardName()
         thread {
             try {
+                // display name + size FIRST: an oversized file is rejected
+                // before it is ever copied into app storage
+                var pickedName = "imported"
+                var remoteSize = -1L
+                contentResolver.query(data.data!!,
+                    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                    null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        pickedName = c.getString(0) ?: pickedName
+                        val si = c.getColumnIndex(OpenableColumns.SIZE)
+                        if (si >= 0 && !c.isNull(si)) remoteSize = c.getLong(si)
+                    }
+                }
                 val f = File(filesDir, "ref_import.tmp")
+                if (remoteSize > MAX_IMPORT_BYTES) {
+                    handler.post { cloneDoneAt(cardIdx, name, -1L, "音频文件过大(>100MB)") }
+                    return@thread
+                }
                 contentResolver.openInputStream(data.data!!)!!.use { input ->
                     f.outputStream().use { input.copyTo(it) }
                 }
-                // picked display name (card files keep their name)
-                var pickedName = "imported"
-                contentResolver.query(data.data!!,
-                    arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                    if (c.moveToFirst()) pickedName = c.getString(0) ?: pickedName
+                // provider didn't report a size (SIZE null/-1) — trust only the
+                // bytes actually copied
+                if (f.length() > MAX_IMPORT_BYTES) {
+                    f.delete()
+                    handler.post { cloneDoneAt(cardIdx, name, -1L, "音频文件过大(>100MB)") }
+                    return@thread
                 }
                 // voice-card file (.spk.npy / npy magic): straight into the library
                 if (isNpyCard(f) || pickedName.endsWith(".spk.npy")
@@ -937,7 +977,9 @@ class MainActivity : Activity() {
         syncBowtie()
     }
 
-    /** Apache-2.0 attribution + consent gate. Decline = exit. */
+    /** Apache-2.0 attribution + consent gate. Decline = exit. Not cancelable:
+     *  a back-key dismiss must not leave the app in the un-wired half-init
+     *  state — the only exits are 同意 (→ finishInit) and 拒绝 (→ finish). */
     private fun showConsent() {
         AlertDialog.Builder(this)
             .setTitle("蝴蝶结变声器")
@@ -950,9 +992,11 @@ class MainActivity : Activity() {
                 "推理运行时:ONNX Runtime (MIT)\n\n" +
                 "使用声明:克隆他人音色前须获得本人明确同意;" +
                 "严禁用于仿冒、欺诈或误导性内容。")
+            .setCancelable(false)
             .setPositiveButton("同意") { _, _ ->
                 getSharedPreferences("app", MODE_PRIVATE)
                     .edit().putBoolean("consented", true).apply()
+                finishInit()   // initEngine bailed before wiring — do it now
             }
             .setNegativeButton("拒绝并退出") { _, _ -> finish() }
             .show()
@@ -1006,11 +1050,27 @@ class MainActivity : Activity() {
         bowtie.devIndex = (if (input) inSpin else outSpin).selectedItemPosition
     }
 
-    /** right wheel settled on an entry */
+    /** right wheel settled on an entry. Switches the engine DIRECTLY through
+     *  the cardExecutor — do NOT rely on spkSpin's onItemSelected: the spinner
+     *  lives in the GONE legacy panel, a GONE view never gets a layout pass,
+     *  and Spinner only fires selection events from layout — so that callback
+     *  can silently never run (the "默认音色切不回去" bug; clone/import always
+     *  worked because they call switchEngineCard themselves). setSelection
+     *  below is bookkeeping for other readers only; when its echo DOES fire,
+     *  the listener's pos==spkExpected / card==activeCard guards no-op it. */
     private fun onRightSelect(idx: Int) {
         say("right select $idx: " + (rightList().getOrNull(idx) ?: "?"))
-        if (idx != spkSpin.selectedItemPosition)
-            spkSpin.setSelection(idx)              // listener swaps the card
+        if (idx !in 0..cards.size) return         // 0..n real entries only
+        val card = if (idx == 0) null else cards[idx - 1]
+        if (card == activeCard) return            // engine already on this card
+        spkExpected = idx
+        activeCard = card
+        val path = if (card == null) File(spkDir, "reference_1.spk.npy").absolutePath
+                   else cardPath(card).absolutePath
+        syncBowtie()
+        switchEngineCard(path, card ?: "默认")
+        if (spkSpin.selectedItemPosition != idx)
+            spkSpin.setSelection(idx)
     }
 
     /** center button: 变声 mode = start/stop; 克隆 mode writes the arrow slot
@@ -1085,7 +1145,17 @@ class MainActivity : Activity() {
                     switchEngineCard(File(spkDir, "reference_1.spk.npy").absolutePath, "默认")
                     if (spkSpin.selectedItemPosition != 0) spkSpin.setSelection(0)
                     say("已删除: $cur(已切回默认音色)")
-                } else syncBowtie()
+                } else {
+                    // the list shrank — the kept cards' positions shifted, so
+                    // re-point the spinner/bowtie at the card the engine still
+                    // has loaded (never just mirror the post-delete position)
+                    val idx = cards.indexOf(activeCard)
+                    val selectTo = if (idx >= 0) idx + 1 else 0
+                    spkExpected = selectTo
+                    if (spkSpin.selectedItemPosition != selectTo)
+                        spkSpin.setSelection(selectTo)
+                    syncBowtie()
+                }
                 say("已删除: $cur")
             }
             .setNegativeButton("取消", null)
@@ -1118,6 +1188,9 @@ class MainActivity : Activity() {
 
     companion object {
         init { System.loadLibrary("onnxruntime"); System.loadLibrary("meanvc") }
+        /** import size cap: parseWav/trimWavFile are whole-file in memory, and
+         *  the clone only ever uses the loudest 10 s anyway */
+        private const val MAX_IMPORT_BYTES = 100L * 1024 * 1024
         @JvmStatic external fun nativeInit(modelsDir: String, spkPath: String, ortThreads: Int): Boolean
         @JvmStatic external fun nativeStart(preRollMs: Double, inDevId: Int, outDevId: Int, aec: Boolean): Boolean
         @JvmStatic external fun nativeStop()

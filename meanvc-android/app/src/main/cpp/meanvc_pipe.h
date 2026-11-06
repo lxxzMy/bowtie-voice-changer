@@ -117,14 +117,17 @@ inline std::vector<float> read_bin(const char* path) {
 }
 
 // numpy v1.0 writer for a 1-D float32 array (speaker cards; load_spk reads
-// them back header-agnostically, but the file must be valid for numpy too)
+// them back, but the file must be valid for numpy too). Written to
+// path+".tmp", flushed, closed, THEN renamed over the target — a crash
+// mid-write must never leave a truncated card that later loads as garbage.
 inline bool write_npy_f32(const std::string& path, const float* v, size_t n) {
     char dict[96];
     int len = snprintf(dict, sizeof dict,
         "{'descr': '<f4', 'fortran_order': False, 'shape': (%zu,), }", n);
     if (len <= 0 || len >= (int)sizeof dict) return false;
     int pad = 64 - ((10 + len) % 64);          // spaces + '\n' end the header
-    FILE* f = fopen(path.c_str(), "wb");
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return false;
     fwrite("\x93NUMPY\x01\x00", 1, 8, f);
     uint16_t hl = (uint16_t)(len + pad);
@@ -132,8 +135,17 @@ inline bool write_npy_f32(const std::string& path, const float* v, size_t n) {
     fwrite(dict, 1, len, f);
     for (int i = 0; i < pad - 1; i++) fputc(' ', f);
     fputc('\n', f);
-    if (fwrite(v, 4, n, f) != n) { fclose(f); return false; }
+    if (fwrite(v, 4, n, f) != n) { fclose(f); remove(tmp.c_str()); return false; }
+    fflush(f);
     fclose(f);
+#ifdef _WIN32
+    remove(path.c_str());                      // rename() fails if target exists
+#endif
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        fprintf(stderr, "ERROR: rename %s -> %s failed\n", tmp.c_str(), path.c_str());
+        return false;
+    }
     return true;
 }
 
@@ -367,26 +379,88 @@ struct Pipe {
         for (auto& g : graphs) load_graph(env, g, ort_threads);
     }
 
+    // Strict numpy reader for voice cards: v1–v3 header, float32 ('<f4' or
+    // '=f4'; '>f4' big-endian is REJECTED, not byte-swapped), C order, shape
+    // exactly (256,), ≥256 floats of payload (trailing pad tolerated). The
+    // header dict is parsed by key — key order and quote style vary between
+    // writers (numpy, torch, write_npy_f32) — never by offset. Anything that
+    // isn't a valid 256-dim f32 card (e.g. a wav renamed .npy) fails here.
     bool load_spk(const std::string& spk_path) {
-        std::vector<float> spks(256, 0.f);
         FILE* f = fopen(spk_path.c_str(), "rb");
-        if (f) {
-            uint8_t hdr[128];
-            size_t hdr_len = fread(hdr, 1, 128, f);
-            int hl = (int)hdr_len;
-            for (int k = 10; k < hl; k++)
-                if (hdr[k] == '\n') { hl = k + 1; break; }
-            fseek(f, hl, SEEK_SET);
-            if (fread(spks.data(), 4, 256, f) != 256) {
-                fclose(f);
-                fprintf(stderr, "ERROR: spk npy too small: %s\n", spk_path.c_str());
-                return false;
-            }
-            fclose(f);
-        } else {
+        if (!f) {
             fprintf(stderr, "ERROR: cannot open spk %s\n", spk_path.c_str());
             return false;
         }
+        auto fail = [&](const std::string& why) {
+            fclose(f);
+            fprintf(stderr, "ERROR: spk npy invalid (%s): %s\n",
+                    why.c_str(), spk_path.c_str());
+            return false;
+        };
+        uint8_t magic[8];
+        if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "\x93NUMPY", 6) != 0)
+            return fail("bad magic");
+        uint8_t major = magic[6];
+        if (major < 1 || major > 3) return fail("unsupported npy version");
+        uint32_t hl;
+        if (major == 1) {                          // v1: 2-byte header length
+            uint8_t b2[2];
+            if (fread(b2, 1, 2, f) != 2) return fail("truncated header");
+            hl = b2[0] | ((uint32_t)b2[1] << 8);
+        } else {                                   // v2/v3: 4-byte header length
+            uint8_t b4[4];
+            if (fread(b4, 1, 4, f) != 4) return fail("truncated header");
+            hl = b4[0] | ((uint32_t)b4[1] << 8) | ((uint32_t)b4[2] << 16) |
+                 ((uint32_t)b4[3] << 24);
+        }
+        if (hl == 0 || hl > (1u << 20)) return fail("bad header length");
+        std::string dict(hl, '\0');
+        if (fread(&dict[0], 1, hl, f) != hl) return fail("truncated header");
+        auto val_of = [&](const char* key) -> std::string {
+            size_t p = dict.find(std::string("'") + key + "'");
+            if (p == std::string::npos)
+                p = dict.find(std::string("\"") + key + "\"");
+            if (p == std::string::npos) return "";
+            p = dict.find(':', p);
+            if (p == std::string::npos) return "";
+            ++p;
+            while (p < dict.size() && (dict[p] == ' ' || dict[p] == '\t')) ++p;
+            if (p >= dict.size()) return "";
+            char q = dict[p];
+            if (q == '\'' || q == '"') {           // quoted scalar (descr)
+                size_t e = dict.find(q, p + 1);
+                return e == std::string::npos ? ""
+                                              : dict.substr(p + 1, e - p - 1);
+            }
+            std::string v;
+            if (dict[p] == '(') {                  // shape tuple: to matching ')'
+                size_t e = dict.find(')', p);
+                if (e == std::string::npos) return "";
+                v = dict.substr(p, e - p + 1);
+            } else {                               // scalar: to the separator
+                size_t e = p;
+                while (e < dict.size() && dict[e] != ',' && dict[e] != '}' &&
+                       dict[e] != '\n')
+                    ++e;
+                v = dict.substr(p, e - p);
+            }
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+                v.pop_back();
+            return v;
+        };
+        std::string descr = val_of("descr");
+        if (descr != "<f4" && descr != "=f4")
+            return fail("descr '" + descr + "' is not float32");
+        if (val_of("fortran_order") != "False") return fail("fortran_order");
+        std::string shape = val_of("shape"), tight;
+        for (char ch : shape)
+            if (ch != ' ' && ch != '\t') tight += ch;
+        if (tight != "(256,)")
+            return fail("shape " + shape + " is not (256,)");
+        std::vector<float> spks(256, 0.f);
+        if (fread(spks.data(), 4, 256, f) != 256)
+            return fail("payload smaller than 256 floats");
+        fclose(f);
         // spks stays a named member feeding the DiT tensor
         spks_ = std::move(spks);
         return true;

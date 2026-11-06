@@ -1,21 +1,41 @@
-# app build outputs & caches
+# ===== 构建产物与缓存 =====
 /meanvc-android/build/
 /meanvc-android/app/build/
 /meanvc-android/.gradle/
-/meanvc-android/local.properties
 /meanvc-android/.idea/
 /meanvc-android/*.iml
-
-# upstream source (has its own repo)
-/MeanVC2/
-
-# workspace test artifacts (root only — app res/ is NOT affected)
-/.zcode/
-/android_artifacts/
-/*.png
-/*.wav
-/*.npy
-/_*.py
-/_*.json
-/_*.txt
 /meanvc-android/app/.cxx/
+/meanvc-android/app/*.keystore
+/meanvc-android/keystore.properties
+
+/win/app/bin/
+/win/app/obj/
+/win/smoke/bin/
+/win/smoke/obj/
+/win/engine/mvc_engine.dll
+/win/engine/onnxruntime.dll
+/win/toolchain/
+/win/nuget_local/*.nupkg
+/win/nuget_local/_specs/
+/win/engine/mvc_engine.lib
+/win/engine/*.pdb
+/win/installer/redist/*.zip
+/win/installer/redist/*.exe
+/win/smoke/*.f32
+/win/smoke/*.wav
+/win/app_ui.png
+/win/screen.png
+/win/smoke/sim_out.wav
+/win/smoke/rt_ref_out.wav
+/win/smoke/rt_ref.csv
+
+# ===== 上游 / 环境（各自有仓库，不入本仓库） =====
+/MeanVC2/
+/android_artifacts/
+
+# ===== 历史（补丁脚本 / 调试残留 / 备份） =====
+/attic/
+
+# ===== 工作区杂项 =====
+/.zcode/
+/meanvc-android/local.properties

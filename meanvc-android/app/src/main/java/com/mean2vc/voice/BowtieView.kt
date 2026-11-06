@@ -113,6 +113,12 @@ class BowtieView(ctx: Context) : View(ctx) {
     // rotations (degrees, follow the finger, snap on release)
     private var rotL = 0f
     private var winW = -4f                  // right belt window start (continuous)
+    // the positions AS LAST DRAWN — the snap on release reads THESE, not the
+    // live values: the tail MOVE events before ACTION_UP are usually not
+    // rendered yet, and snapping on the un-rendered tail is what made the
+    // wheel visibly point at 音色3 and then land on 音色4 ("所见即所吸")
+    private var drawnWinW = -4f
+    private var drawnRotL = 0f
     private var lastSel = 0                 // last fired right-list index
     private var dragDial = 0
     private var knotDown = false
@@ -202,6 +208,9 @@ class BowtieView(ctx: Context) : View(ctx) {
         drawWheel(c, dialL, rotL, leftLabels, outside = 180f)
         drawBelt(c, dialR, rightListProvider?.invoke() ?: emptyList(),
             winW, outside = 0f)
+        // this frame is the user's truth — the release snap reads these
+        drawnWinW = winW
+        drawnRotL = rotL
     }
 
     private fun drawWing(c: Canvas, mirror: Boolean) {
@@ -500,11 +509,23 @@ class BowtieView(ctx: Context) : View(ctx) {
             MotionEvent.ACTION_MOVE -> {
                 if (dragDial == 0) return true
                 if (running || cloneBusy) { dragDial = 0; return true }   // locked mid-drag
+                if (e.pointerCount != 1) return true                      // second finger: freeze
                 val pv = if (dragDial == 1) dialL else dialR
                 val a = angAt(pv, e.x, e.y)
                 var d = a - dragLastAng
                 if (d > 180) d -= 360; if (d < -180) d += 360
                 dragLastAng = a
+                // Near the hub the contact angle is ill-defined: a fast flick
+                // whose samples cross the pivot reads up to ±180° apart in ONE
+                // event — the ±180 wrap-normalize above passes those straight
+                // through, spinning the wheel 4 detents per sample ("拨一下跳
+                // 好几格"). Freeze inside the hub; deltas resume from wherever
+                // the finger leaves it (dragLastAng already updated).
+                val hx = e.x - pv.x; val hy = e.y - pv.y
+                if (hx * hx + hy * hy < (dialR_ * 0.45f) * (dialR_ * 0.45f)) return true
+                // Clamp what's left: a single ~60 Hz sample never carries more
+                // than one detent of real human motion
+                d = d.coerceIn(-45f, 45f)
                 if (dragDial == 1) rotL = (rotL + d).coerceIn(-45f, 0f)
                 else {
                     val n = (rightListProvider?.invoke() ?: emptyList()).size
@@ -523,17 +544,18 @@ class BowtieView(ctx: Context) : View(ctx) {
                 val quick = System.currentTimeMillis() - downTime < 500 &&
                         abs(e.x - downX) < 48 && abs(e.y - downY) < 48
                 if (dragDial == 1 && !quick) {
-                    rotL = Math.round(rotL / 45f).coerceIn(-1, 0) * 45f
+                    rotL = Math.round(drawnRotL / 45f).coerceIn(-1, 0) * 45f
                     val idx = -Math.round(rotL / 45f).toInt()   // 0 变声 / 1 克隆
                     haptic()
                     onLeftMode?.invoke(idx)
                 }
                 if (dragDial == 2 && !quick) {
                     val n = (rightListProvider?.invoke() ?: emptyList()).size
-                    val s = Math.round(winW).toInt() + 4
+                    val s = Math.round(drawnWinW).toInt() + 4
                     winW = (s - 4).toFloat()
                     curSlot = s
-                    android.util.Log.i("meanvc", "wheel snap s=$s winW=$winW")
+                    android.util.Log.i("meanvc",
+                        "wheel snap s=$s winW=$winW (drawn=$drawnWinW)")
                     haptic()
                     if (s in 0 until n && s != lastSel) {
                         onRightSelect?.invoke(s)
