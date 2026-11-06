@@ -8,7 +8,7 @@
 C++（ONNX Runtime），并配上了转盘式的三端交互。
 
 <p align="center">
-  <img src="assets-src/bowtie_bg.jpeg" width="420" alt="蝴蝶结变声器"/>
+  <img src="docs/banner.png" alt="蝴蝶结变声器 Android / Windows 双端界面"/>
 </p>
 
 ## ✨ 功能
